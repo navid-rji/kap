@@ -84,6 +84,7 @@ class InteractiveAcquisitionController:
         # --- Franka EE pose (from franka_state_controller) ---
         self.pose_lock = threading.Lock()
         self.last_ee_pose = None  # type: Pose | None
+        self.last_ee_wrench = None        # type: dict | None
 
         rospy.Subscriber("/franka_state_controller/franka_states",
                          FrankaState, self.on_franka_state, queue_size=1, tcp_nodelay=True)
@@ -273,13 +274,24 @@ class InteractiveAcquisitionController:
         p.orientation.y = float(qy)
         p.orientation.z = float(qz)
         p.orientation.w = float(qw)
+        
+        # External wrench at end effector, expressed in base frame (panda_link0)
+        # msg.O_F_ext_hat_K = [Fx, Fy, Fz, Tx, Ty, Tz]
+        w = np.array(msg.O_F_ext_hat_K, dtype=np.float64).reshape((6,))
+        wrench = {
+            "frame": "panda_link0",
+            "force_N": {"x": float(w[0]), "y": float(w[1]), "z": float(w[2])},
+            "torque_Nm": {"x": float(w[3]), "y": float(w[4]), "z": float(w[5])},
+            "raw": [float(x) for x in w.tolist()],
+        }
 
         with self.pose_lock:
             self.last_ee_pose = p
-
-    def get_latest_pose(self):
+            self.last_ee_wrench = wrench
+    
+    def get_latest_state(self):
         with self.pose_lock:
-            return self.last_ee_pose
+            return self.last_ee_pose, self.last_ee_wrench
 
     # ------------------------------------------------------------------
     # Sweep logic
@@ -376,7 +388,7 @@ class InteractiveAcquisitionController:
                     continue
 
                 # Ger current robot pose
-                current_pose = self.get_latest_pose()
+                current_pose, current_wrench = self.get_latest_state()
                 rospy.loginfo("Retrieved latest pose.")
 
                 # Convert and save image
@@ -422,6 +434,10 @@ class InteractiveAcquisitionController:
                             "w": current_pose.orientation.w,
                         }
                     }
+                
+                if current_wrench is not None:
+                    rospy.loginfo("Current wrench exists and is added to metadata.")
+                    frame_meta["wrench"] = current_wrench
 
                 sweep_meta["frames"].append(frame_meta)
 
