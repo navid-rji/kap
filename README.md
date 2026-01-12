@@ -17,10 +17,10 @@ roslaunch franka_control franka_control.launch robot_ip:=172.31.1.149
 
 4. start the clarius driver node in the third terminal
 ```
-rosrun kap clarius-driver-node.py -p <port>
+rosrun kap clarius_driver_node.py -p <port>
 ```
 
 5. start the acquisition controller in the fourth terminal
 ```
-rosrun kap acquisition-controller.py
+rosrun kap acquisition_controller.py
 ```
