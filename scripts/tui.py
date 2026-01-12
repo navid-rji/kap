@@ -87,147 +87,201 @@ class SweepDone(Message):
 
 
 # -------------------------
-# Sweep runner (no monkeypatching)
+# Sweep runner
 # -------------------------
 def _frange(v_min: float, v_max: float, v_step: float) -> list[float]:
     if v_step <= 0.0:
-        return [float(v_min)]
+        return [v_min]
     n_steps = int((v_max - v_min) / v_step + 1e-6)
     return [round(v_min + i * v_step, 6) for i in range(n_steps + 1)]
 
 
 def run_sweep_with_progress(
-    controller: InteractiveAcquisitionController,
+    controller,
     mode: str,
     stop_event: threading.Event,
     post_log: Callable[[str], None],
     post_status: Callable[[SweepStatus], None],
 ) -> tuple[bool, str]:
     """
-    Re-implements the sweep loop using controller's public methods/fields
-    so we can drive a progress bar cleanly.
+    Re-implements perform_sweep as close as possible to the original:
+      - uses pub_tx_freq / pub_tx_focus publish (no ack/blocking methods)
+      - keeps the same fixed rospy.sleep(3) in both loops
+      - uses controller.wait_for_image(timeout=None) (infinite wait, original behavior)
+      - preserves metadata structure and global_frame_index behavior
+
+    stop_event is only used to allow clean UI quit/stop; if set, we stop early.
     """
     mode_l = mode.lower().strip()
-    if mode_l not in ("freq", "focus", "both"):
-        return False, f"Invalid mode '{mode}'. Expected freq|focus|both."
+    if mode_l == "freq":
+        do_freq, do_focus = True, False
+    elif mode_l == "focus":
+        do_freq, do_focus = False, True
+    elif mode_l == "both":
+        do_freq, do_focus = True, True
+    else:
+        return False, f"Invalid sweep mode: {mode}"
 
-    do_freq = mode_l in ("freq", "both")
-    do_focus = mode_l in ("focus", "both")
-
-    # Build sweep values
-    freq_values = _frange(controller.freq_min, controller.freq_max, controller.freq_step) if do_freq else [controller.freq_min]
-    focus_values = _frange(controller.focus_min, controller.focus_max, controller.focus_step) if do_focus else [controller.focus_min]
+    # Prepare sweep values (same semantics)
+    freq_values = _frange(controller.freq_min, controller.freq_max,
+                          controller.freq_step) if do_freq else [controller.freq_min]
+    focus_values = _frange(controller.focus_min, controller.focus_max,
+                           controller.focus_step) if do_focus else [controller.focus_min]
     total_steps = len(freq_values) * len(focus_values)
 
-    # Allocate sweep id and metadata container (mirrors controller.perform_sweep format)
+    # Allocate sweep id (same behavior)
     sweep_id = controller.sweep_counter
     controller.sweep_counter += 1
 
+    post_log(
+        f"Starting sweep #{sweep_id} (mode={mode_l}), steps={total_steps}")
+
     sweep_meta = {
-        "sweep_id": int(sweep_id),
+        "sweep_id": sweep_id,
         "mode": mode_l,
         "start_time": datetime.now().isoformat(),
         "parameters": {
-            "txFreq": {"min": float(controller.freq_min), "max": float(controller.freq_max), "step": float(controller.freq_step)},
-            "txFocus": {"min": float(controller.focus_min), "max": float(controller.focus_max), "step": float(controller.focus_step)},
+            "txFreq": {"min": controller.freq_min, "max": controller.freq_max, "step": controller.freq_step},
+            "txFocus": {"min": controller.focus_min, "max": controller.focus_max, "step": controller.focus_step},
         },
         "frames": [],
     }
 
-    post_log(f"Starting sweep #{sweep_id} (mode={mode_l}), steps={total_steps}")
-
-    # Main loop
     step_idx = 0
     last_image_file: Optional[str] = None
-    current_f = float(freq_values[0])
-    current_z = float(focus_values[0])
 
+    # Outer loop over frequency, inner over focus (same ordering)
     for f_val in freq_values:
         if stop_event.is_set() or rospy.is_shutdown():
             break
 
-        current_f = float(f_val)
-        post_log(f"Setting txFreq={current_f:.3f} MHz")
-
-        # Prefer blocking set (ack-based) if available; falls back to publish+sleep if ROS is shutting down.
-        ok = controller.set_tx_freq_blocking(current_f)
-        if not ok and rospy.is_shutdown():
-            break
+        rospy.sleep(3)
+        post_log(f"Setting txFreq = {f_val:.3f} MHz")
+        controller.pub_tx_freq.publish(Float32(f_val))
 
         for z_val in focus_values:
             if stop_event.is_set() or rospy.is_shutdown():
                 break
 
-            current_z = float(z_val)
-            post_log(f"Setting txFocus={current_z:.3f} cm")
+            rospy.sleep(3)
+            post_log(f"Setting txFocus = {z_val:.3f} cm")
+            controller.pub_tx_focus.publish(Float32(z_val))
 
-            ok = controller.set_tx_focus_blocking(current_z)
-            if not ok and rospy.is_shutdown():
-                break
-
-            # Let image settle
+            # Let image settle (same)
             rospy.sleep(controller.settle_time)
 
-            # Clear previous and request new image
+            # Clear any previous response and request a fresh image (same)
             with controller.image_lock:
                 controller.last_image = None
 
+            post_log("Requesting image from Clarius...")
             controller.pub_request.publish(Empty())
-            img_msg = controller.wait_for_image(timeout=5.0)
 
-            note = ""
+            # Original behavior: block indefinitely for image
+            img_msg = controller.wait_for_image(timeout=None)
             if img_msg is None:
-                note = "No image received (timeout)."
+                # Original semantics: warn and continue
+                note = "No image received (node is shutting down?)."
                 post_log(f"WARNING: {note}")
-            else:
-                # Get current robot state
-                current_pose, current_wrench = controller.get_latest_state()
+                step_idx += 1
+                post_status(
+                    SweepStatus(
+                        running=True,
+                        mode=mode_l,
+                        step=step_idx,
+                        total_steps=total_steps,
+                        tx_freq=float(f_val),
+                        tx_focus=float(z_val),
+                        last_image=last_image_file,
+                        note=note,
+                    )
+                )
+                continue
 
-                # Convert and save image
-                try:
-                    cv_img = controller.bridge.imgmsg_to_cv2(img_msg, desired_encoding="passthrough")
-                except Exception as e:
-                    post_log(f"ERROR: cv_bridge conversion failed: {e}")
-                    cv_img = None
+            # Get current robot pose (same)
+            current_pose, current_wrench = controller.get_latest_state()
+            post_log("Retrieved latest pose.")
 
-                if cv_img is not None:
-                    img_filename = f"img_{controller.global_frame_index:06d}.png"
-                    img_path = os.path.join(controller.output_dir, img_filename)
+            # Convert and save image (same)
+            try:
+                cv_img = controller.bridge.imgmsg_to_cv2(
+                    img_msg, desired_encoding="passthrough")
+            except Exception as e:
+                post_log(
+                    f"ERROR: Failed to convert ROS Image to cv2 image: {e}")
+                step_idx += 1
+                post_status(
+                    SweepStatus(
+                        running=True,
+                        mode=mode_l,
+                        step=step_idx,
+                        total_steps=total_steps,
+                        tx_freq=float(f_val),
+                        tx_focus=float(z_val),
+                        last_image=last_image_file,
+                        note="cv_bridge conversion failed",
+                    )
+                )
+                continue
 
-                    ok_write = cv2.imwrite(img_path, cv_img)
-                    if not ok_write:
-                        post_log(f"ERROR: Failed to write image to {img_path}")
-                    else:
-                        last_image_file = img_filename
+            img_filename = f"img_{controller.global_frame_index:06d}.png"
+            img_path = os.path.join(controller.output_dir, img_filename)
 
-                        frame_meta = {
-                            "index": int(controller.global_frame_index),
-                            "image_file": img_filename,
-                            "timestamp": float(img_msg.header.stamp.to_sec()),
-                            "txFreq": float(current_f),
-                            "txFocus": float(current_z),
-                        }
+            ok = cv2.imwrite(img_path, cv_img)
+            if not ok:
+                post_log(f"ERROR: Failed to write image to {img_path}")
+                step_idx += 1
+                post_status(
+                    SweepStatus(
+                        running=True,
+                        mode=mode_l,
+                        step=step_idx,
+                        total_steps=total_steps,
+                        tx_freq=float(f_val),
+                        tx_focus=float(z_val),
+                        last_image=last_image_file,
+                        note="cv2.imwrite failed",
+                    )
+                )
+                continue
 
-                        if current_pose is not None:
-                            frame_meta["pose"] = {
-                                "position": {
-                                    "x": float(current_pose.position.x),
-                                    "y": float(current_pose.position.y),
-                                    "z": float(current_pose.position.z),
-                                },
-                                "orientation": {
-                                    "x": float(current_pose.orientation.x),
-                                    "y": float(current_pose.orientation.y),
-                                    "z": float(current_pose.orientation.z),
-                                    "w": float(current_pose.orientation.w),
-                                },
-                            }
+            last_image_file = img_filename
 
-                        if current_wrench is not None:
-                            frame_meta["wrench"] = current_wrench
+            # Frame metadata (same keys/types as your original)
+            frame_meta = {
+                "index": int(controller.global_frame_index),
+                "image_file": img_filename,
+                "timestamp": img_msg.header.stamp.to_sec(),
+                "txFreq": float(f_val),
+                "txFocus": float(z_val),
+            }
 
-                        sweep_meta["frames"].append(frame_meta)
-                        controller.global_frame_index += 1
+            if current_pose is not None:
+                frame_meta["pose"] = {
+                    "position": {
+                        "x": current_pose.position.x,
+                        "y": current_pose.position.y,
+                        "z": current_pose.position.z,
+                    },
+                    "orientation": {
+                        "x": current_pose.orientation.x,
+                        "y": current_pose.orientation.y,
+                        "z": current_pose.orientation.z,
+                        "w": current_pose.orientation.w,
+                    },
+                }
+
+            if current_wrench is not None:
+                frame_meta["wrench"] = current_wrench
+
+            sweep_meta["frames"].append(frame_meta)
+
+            post_log(
+                f"Sweep #{sweep_id}: saved image {img_filename} "
+                f"(txFreq={f_val:.3f} MHz, txFocus={z_val:.3f} cm)."
+            )
+
+            controller.global_frame_index += 1
 
             step_idx += 1
             post_status(
@@ -236,30 +290,32 @@ def run_sweep_with_progress(
                     mode=mode_l,
                     step=step_idx,
                     total_steps=total_steps,
-                    tx_freq=current_f,
-                    tx_focus=current_z,
+                    tx_freq=float(f_val),
+                    tx_focus=float(z_val),
                     last_image=last_image_file,
-                    note=note,
+                    note="",
                 )
             )
 
-            if controller.extra_step_delay and controller.extra_step_delay > 0.0:
+            if controller.extra_step_delay > 0.0:
                 rospy.sleep(controller.extra_step_delay)
 
-    # Finalize sweep metadata (write even if partial)
+    # Finalize sweep metadata (same)
     sweep_meta["end_time"] = datetime.now().isoformat()
     controller.metadata["sweeps"].append(sweep_meta)
     controller._save_metadata()
 
     if stop_event.is_set():
-        post_log(f"Sweep #{sweep_id} stopped early. Saved {len(sweep_meta['frames'])} frames.")
+        post_log(
+            f"Sweep #{sweep_id} stopped early. Saved {len(sweep_meta['frames'])} frames.")
         return False, "Stopped by user."
-
     if rospy.is_shutdown():
-        post_log(f"Sweep #{sweep_id} ended due to ROS shutdown. Saved {len(sweep_meta['frames'])} frames.")
+        post_log(
+            f"Sweep #{sweep_id} ended due to ROS shutdown. Saved {len(sweep_meta['frames'])} frames.")
         return False, "ROS shutdown."
 
-    post_log(f"Finished sweep #{sweep_id}. Saved {len(sweep_meta['frames'])} frames.")
+    post_log(
+        f"Finished sweep #{sweep_id}. Saved {len(sweep_meta['frames'])} frames.")
     return True, "OK"
 
 
@@ -384,7 +440,8 @@ class AcquisitionTUI(App):
                     with Container(classes="row"):
                         yield Label("Mode")
                         yield Select(
-                            options=[("both", "both"), ("freq", "freq"), ("focus", "focus")],
+                            options=[("both", "both"),
+                                     ("freq", "freq"), ("focus", "focus")],
                             value="both",
                             id="mode_select",
                         )
@@ -605,7 +662,8 @@ class AcquisitionTUI(App):
             self.post_message(SweepDone(ok=ok, reason=reason))
 
         self._log(f"Launching sweep thread (mode={mode})")
-        self.sweep_thread = threading.Thread(target=worker, name="sweep_worker", daemon=True)
+        self.sweep_thread = threading.Thread(
+            target=worker, name="sweep_worker", daemon=True)
         self.sweep_thread.start()
 
     def _stop_sweep(self) -> None:
