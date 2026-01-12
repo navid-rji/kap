@@ -3,8 +3,8 @@
 #
 # Starts:
 #   1) franka_control (NOT in conda env)
-#   2) clarius-driver-node.py (in conda env "Navid")
-#   3) acquisition-controller.py (in conda env "Navid")
+#   2) clarius_driver_node.py (in conda env "Navid")
+#   3) acquisition_controller.py or tui.py (in conda env "Navid")
 #
 # Assumes: roscore already running.
 
@@ -18,8 +18,10 @@ PROBE_IP="192.168.1.1"
 ROBOT_IP="172.31.1.149"
 PORT=""
 
-# Extra args passed through to clarius-driver-node.py (besides -a/-p we manage)
+# Extra args passed through to clarius_driver_node.py (besides -a/-p we manage)
 DRIVER_EXTRA_ARGS=()
+INTERFACE_SCRIPT=""
+INTERFACE_DESC=""
 
 # -----------------------------
 # Helpers
@@ -37,13 +39,53 @@ Examples:
 Notes:
   - roscore is NOT started by this script.
   - franka_control runs outside conda.
-  - clarius driver + acquisition controller run inside conda env "Navid".
+  - clarius driver + CLI/TUI run inside conda env "Navid".
 EOF
 }
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+
+set_interface_choice() {
+  local lowered
+  lowered="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$lowered" in
+    c|cli)
+      INTERFACE_SCRIPT="acquisition_controller.py"
+      INTERFACE_DESC="CLI"
+      return 0
+      ;;
+    t|tui)
+      INTERFACE_SCRIPT="tui.py"
+      INTERFACE_DESC="TUI"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+prompt_interface_choice() {
+  if [[ -n "${KAP_INTERFACE:-}" ]]; then
+    set_interface_choice "$KAP_INTERFACE" || die "Invalid KAP_INTERFACE (use 'cli' or 'tui')."
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    die "Non-interactive session detected. Set KAP_INTERFACE=cli or KAP_INTERFACE=tui to skip the prompt."
+  fi
+
+  local choice
+  while true; do
+    read -rp "[kap] Select interface ([c]li/[t]ui): " choice || continue
+    if set_interface_choice "$choice"; then
+      break
+    fi
+    echo "Please answer 'cli' or 'tui'." >&2
+  done
+}
 
 # Determine script directory (this file lives in .../clarius_ultrasound/scripts)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -150,11 +192,14 @@ need_cmd roslaunch
 # shellcheck disable=SC1090
 source "$CATKIN_ROOT/devel/setup.bash"
 
-# Ensure the Clarius shared libs are where clarius-driver-node.py expects them (./libcast.so)
+# Ensure the Clarius shared libs are where clarius_driver_node.py expects them (./libcast.so)
 [[ -f "$SCRIPT_DIR/libcast.so" ]] || die "Missing $SCRIPT_DIR/libcast.so"
 [[ -f "$SCRIPT_DIR/pyclariuscast.so" ]] || die "Missing $SCRIPT_DIR/pyclariuscast.so"
-[[ -f "$SCRIPT_DIR/clarius-driver-node.py" ]] || die "Missing $SCRIPT_DIR/clarius-driver-node.py"
-[[ -f "$SCRIPT_DIR/acquisition-controller.py" ]] || die "Missing $SCRIPT_DIR/acquisition-controller.py"
+[[ -f "$SCRIPT_DIR/clarius_driver_node.py" ]] || die "Missing $SCRIPT_DIR/clarius_driver_node.py"
+[[ -f "$SCRIPT_DIR/acquisition_controller.py" ]] || die "Missing $SCRIPT_DIR/acquisition_controller.py"
+[[ -f "$SCRIPT_DIR/tui.py" ]] || die "Missing $SCRIPT_DIR/tui.py"
+
+prompt_interface_choice
 
 CONDA_SH="$(find_conda_sh || true)"
 [[ -n "${CONDA_SH:-}" ]] || die "Could not locate conda.sh. Ensure conda is installed and accessible."
@@ -190,9 +235,9 @@ FRANKA_PID=$!
 PIDS+=("$FRANKA_PID")
 
 # -----------------------------
-# 2) Start Clarius driver + acquisition controller (inside conda env)
+# 2) Start Clarius driver + selected interface (inside conda env)
 # -----------------------------
-echo "[kap] Starting Clarius driver + acquisition controller in conda env 'Navid' ..."
+echo "[kap] Starting Clarius driver + $INTERFACE_DESC interface in conda env 'Navid' ..."
 (
   set -euo pipefail
 
@@ -206,16 +251,28 @@ echo "[kap] Starting Clarius driver + acquisition controller in conda env 'Navid
 
   cd "$SCRIPT_DIR"
 
-  echo "[kap]   clarius-driver-node.py --ip $PROBE_IP --port $PORT ${DRIVER_EXTRA_ARGS[*]:-}"
-  python clarius-driver-node.py --ip "$PROBE_IP" --port "$PORT" "${DRIVER_EXTRA_ARGS[@]:-}" &
+  DRIVER_CMD=(python clarius_driver_node.py --ip "$PROBE_IP" --port "$PORT")
+  if ((${#DRIVER_EXTRA_ARGS[@]})); then
+    DRIVER_CMD+=("${DRIVER_EXTRA_ARGS[@]}")
+  fi
+
+  INTERFACE_CMD=(python "$INTERFACE_SCRIPT")
+
+  DRIVER_PID=""
+  conda_cleanup() {
+    if [[ -n "${DRIVER_PID:-}" ]] && kill -0 "$DRIVER_PID" >/dev/null 2>&1; then
+      kill "$DRIVER_PID" >/dev/null 2>&1 || true
+      wait "$DRIVER_PID" >/dev/null 2>&1 || true
+    fi
+  }
+  trap conda_cleanup EXIT INT TERM
+
+  echo "[kap]   ${DRIVER_CMD[*]}"
+  "${DRIVER_CMD[@]}" &
   DRIVER_PID=$!
 
-  echo "[kap]   acquisition-controller.py"
-  python acquisition-controller.py &
-  ACQ_PID=$!
-
-  # Wait until one exits; propagate exit code
-  wait "$DRIVER_PID" "$ACQ_PID"
+  echo "[kap]   $INTERFACE_SCRIPT ($INTERFACE_DESC foreground)"
+  "${INTERFACE_CMD[@]}"
 ) &
 CONDA_GROUP_PID=$!
 PIDS+=("$CONDA_GROUP_PID")
